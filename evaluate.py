@@ -1,22 +1,28 @@
-"""Evaluate SealBot by playing it against a built-in random baseline.
+"""Evaluate SealBot: current/ vs best/ (or random / self-play).
 
 Usage:
-    python evaluate.py [-n NUM_GAMES] [-t TIME_LIMIT]
-    python evaluate.py --self-play [-n NUM_GAMES] [-t TIME_LIMIT]
+    python evaluate.py                # current vs best
+    python evaluate.py --random       # current vs built-in random
+    python evaluate.py --self-play    # current vs itself
 """
 
 import argparse
+import json
 import math
+import os
 import random
+import subprocess
 import sys
 import time
 from collections import defaultdict
-from multiprocessing import Pool
 
 from tqdm import tqdm
 
 from game import HexGame, Player
-from minimax_cpp import MinimaxBot
+
+ROOT = os.path.abspath(os.path.dirname(__file__))
+CURRENT_DIR = os.path.join(ROOT, "current")
+BEST_DIR = os.path.join(ROOT, "best")
 
 
 # ── Constants ──
@@ -113,17 +119,12 @@ def _win_rate_stats(wins, losses, draws):
         p_value = 2 * _norm_sf(abs(z_obs))
     else:
         p_value = 1.0
-    elo_diff = _score_to_elo(p_hat)
-    elo_lo = _score_to_elo(ci_lo)
-    elo_hi = _score_to_elo(ci_hi)
-    return p_hat, ci_lo, ci_hi, p_value, elo_diff, elo_lo, elo_hi
+    return p_hat, ci_lo, ci_hi, p_value, _score_to_elo(p_hat), _score_to_elo(ci_lo), _score_to_elo(ci_hi)
 
 
 def _score_to_elo(score):
-    if score <= 0.0:
-        return float('-inf')
-    if score >= 1.0:
-        return float('inf')
+    if score <= 0.0: return float('-inf')
+    if score >= 1.0: return float('inf')
     return -400 * math.log10(1.0 / score - 1.0)
 
 
@@ -169,8 +170,7 @@ def play_game(bot_a, bot_b, win_length=6, violations=None, max_moves=None):
         num_moves = len(moves)
         times[player][0] += elapsed
         times[player][1] += num_moves
-        allowed_time = bot.time_limit * num_moves
-        if elapsed > allowed_time * GRACE_FACTOR:
+        if elapsed > bot.time_limit * num_moves * GRACE_FACTOR:
             if violations is not None:
                 violations[bot] = violations.get(bot, 0) + 1
                 if violations[bot] >= MAX_VIOLATIONS_PER_GAME:
@@ -181,31 +181,41 @@ def play_game(bot_a, bot_b, win_length=6, violations=None, max_moves=None):
             return (Player.NONE, depths[Player.A], depths[Player.B],
                     tuple(times[Player.A]), tuple(times[Player.B]))
 
-        invalid = False
         for q, r in moves:
             if game.game_over or not game.make_move(q, r):
-                invalid = True
-                break
-        if invalid:
-            return (Player.B if player == Player.A else Player.A,
-                    depths[Player.A], depths[Player.B],
-                    tuple(times[Player.A]), tuple(times[Player.B]))
+                return (Player.B if player == Player.A else Player.A,
+                        depths[Player.A], depths[Player.B],
+                        tuple(times[Player.A]), tuple(times[Player.B]))
 
     return (game.winner, depths[Player.A], depths[Player.B],
             tuple(times[Player.A]), tuple(times[Player.B]))
 
 
-def _play_one(args):
-    time_limit, game_idx, win_length, max_moves, self_play = args
+# ── Worker for same-module modes (random / self-play) ──
+
+def _load_current_bot(time_limit):
+    sys.path.insert(0, CURRENT_DIR)
+    from minimax_cpp import MinimaxBot
+    sys.path.pop(0)
+    return MinimaxBot(time_limit)
+
+
+def _play_one_same(args):
+    time_limit, game_idx, win_length, max_moves, mode, current_dir = args
     swapped = game_idx % 2 == 1
 
-    bot_seal = BotRunner("SealBot", MinimaxBot(time_limit).get_move, time_limit,
-                         bot_obj=MinimaxBot(time_limit))
-    if self_play:
-        bot_opp = BotRunner("SealBot_B", MinimaxBot(time_limit).get_move, time_limit,
-                            bot_obj=MinimaxBot(time_limit))
-    else:
+    sys.path.insert(0, current_dir)
+    from minimax_cpp import MinimaxBot
+    sys.path.pop(0)
+
+    seal = MinimaxBot(time_limit)
+    bot_seal = BotRunner("current", seal.get_move, time_limit, bot_obj=seal)
+
+    if mode == "random":
         bot_opp = BotRunner("random", _random_get_move, time_limit)
+    else:
+        seal2 = MinimaxBot(time_limit)
+        bot_opp = BotRunner("current_B", seal2.get_move, time_limit, bot_obj=seal2)
 
     if swapped:
         seat_a, seat_b = bot_opp, bot_seal
@@ -223,73 +233,202 @@ def _play_one(args):
         d_a, d_b = defaultdict(int), defaultdict(int)
         t_a, t_b = (0.0, 0), (0.0, 0)
 
-    move_count = t_a[1] + t_b[1]
-    return (winner, swapped, dict(d_a), dict(d_b),
+    return (winner.value, swapped, dict(d_a), dict(d_b),
             violations.get(seat_a, 0), violations.get(seat_b, 0),
-            exceeded, t_a, t_b, move_count)
+            exceeded, t_a, t_b, t_a[1] + t_b[1])
 
+
+# ── Subprocess worker for current vs best ──
+# (Two different C extensions with same PyInit_ name can't coexist in one process)
+
+_WORKER_SCRIPT = r'''
+import sys, json, os, time
+from collections import defaultdict
+
+root_dir, time_limit, game_idx, win_length, max_moves = (
+    sys.argv[1], float(sys.argv[2]),
+    int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5]))
+
+best_dir = os.path.join(root_dir, "best")
+current_dir = os.path.join(root_dir, "current")
+
+# Load best first, stash it, then load current
+sys.path.insert(0, best_dir)
+import minimax_cpp as _best_mod
+BestBot = _best_mod.MinimaxBot
+del sys.modules["minimax_cpp"]
+sys.path.pop(0)
+
+sys.path.insert(0, current_dir)
+import minimax_cpp
+CurrentBot = minimax_cpp.MinimaxBot
+
+# game.py is in root_dir
+sys.path.insert(0, root_dir)
+import game as game_mod
+
+swapped = game_idx % 2 == 1
+
+class Bot:
+    def __init__(self, name, engine, tl):
+        self.name = name
+        self._e = engine
+        self.time_limit = tl
+    @property
+    def last_depth(self):
+        return getattr(self._e, "last_depth", 0)
+    def get_move(self, g):
+        self._e.time_limit = self.time_limit
+        return self._e.get_move(g)
+
+cur = Bot("current", CurrentBot(time_limit), time_limit)
+bst = Bot("best", BestBot(time_limit), time_limit)
+
+if swapped:
+    seat_a, seat_b = bst, cur
+else:
+    seat_a, seat_b = cur, bst
+
+g = game_mod.HexGame(win_length=win_length)
+bots = {game_mod.Player.A: seat_a, game_mod.Player.B: seat_b}
+da, db = defaultdict(int), defaultdict(int)
+ta, tb = [0.0, 0], [0.0, 0]
+total = 0; violations = {}; exceeded = False; winner_val = 0
+
+while not g.game_over:
+    p = g.current_player
+    b = bots[p]
+    t0 = time.time()
+    moves = b.get_move(g)
+    el = time.time() - t0
+    if not moves:
+        winner_val = 2 if p == game_mod.Player.A else 1; break
+    nm = len(moves)
+    (ta if p == game_mod.Player.A else tb)[0] += el
+    (ta if p == game_mod.Player.A else tb)[1] += nm
+    (da if p == game_mod.Player.A else db)[b.last_depth] += nm
+    if el > b.time_limit * nm * 3.0:
+        violations[b.name] = violations.get(b.name, 0) + 1
+        if violations[b.name] >= 10: exceeded = True; break
+    total += nm
+    if total >= max_moves: break
+    bad = False
+    for q, r in moves:
+        if g.game_over or not g.make_move(q, r): bad = True; break
+    if bad:
+        winner_val = 2 if p == game_mod.Player.A else 1; break
+
+if not exceeded and g.game_over:
+    winner_val = g.winner.value
+
+print(json.dumps({"winner": winner_val, "swapped": swapped,
+    "d_a": dict(da), "d_b": dict(db),
+    "v_a": violations.get(seat_a.name, 0), "v_b": violations.get(seat_b.name, 0),
+    "exceeded": exceeded, "t_a": ta, "t_b": tb, "move_count": total}))
+'''
+
+
+def _find_so(directory):
+    for name in os.listdir(directory):
+        if name.startswith("minimax_cpp") and (name.endswith(".so") or name.endswith(".pyd")):
+            return os.path.join(directory, name)
+    return None
+
+
+def _play_one_cross(root_dir, python_exe, time_limit, game_idx,
+                    win_length, max_moves):
+    result = subprocess.run(
+        [python_exe, "-c", _WORKER_SCRIPT,
+         root_dir, str(time_limit), str(game_idx),
+         str(win_length), str(max_moves)],
+        capture_output=True, text=True, timeout=max_moves * time_limit * 4 + 30)
+    if result.returncode != 0:
+        sys.stderr.write(result.stderr)
+        return None
+    return json.loads(result.stdout.strip())
+
+
+# ── Main evaluate ──
 
 def evaluate(num_games=20, win_length=6, time_limit=0.1, use_tqdm=True,
-             max_moves=None, self_play=False):
+             max_moves=None, mode="best"):
     if max_moves is None:
         max_moves = MAX_MOVES_PER_GAME
 
-    name_a = "SealBot"
-    name_b = "SealBot_B" if self_play else "random"
+    name_a = "current"
+    name_b = {"best": "best", "random": "random", "self": "current_B"}[mode]
 
-    bot_a_wins = 0
-    bot_b_wins = 0
-    draws = 0
-    games_played = 0
-    bot_a_depths = defaultdict(int)
-    bot_b_depths = defaultdict(int)
-    bot_a_violations = 0
-    bot_b_violations = 0
-    aborted_games = 0
-    bot_a_time = [0.0, 0]
-    bot_b_time = [0.0, 0]
+    bot_a_wins = bot_b_wins = draws = games_played = 0
+    bot_a_violations = bot_b_violations = aborted_games = 0
+    bot_a_depths, bot_b_depths = defaultdict(int), defaultdict(int)
+    bot_a_time, bot_b_time = [0.0, 0], [0.0, 0]
     game_lengths = []
-
-    workers = min(num_games, __import__('os').cpu_count() or 1)
-    args = [(time_limit, i, win_length, max_moves, self_play) for i in range(num_games)]
-
     t0 = time.time()
-    with Pool(workers) as pool:
-        results_iter = pool.imap_unordered(_play_one, args)
-        if use_tqdm:
-            results_iter = tqdm(results_iter, total=num_games, desc="Games", unit="game")
-        for result in results_iter:
-            winner, swapped, d_a, d_b, v_a, v_b, exceeded, t_a, t_b, move_count = result
 
-            if exceeded:
-                aborted_games += 1
-            else:
-                game_lengths.append(move_count)
+    def _accum(wv, sw, da, db, va, vb, exc, ta, tb, mc):
+        nonlocal bot_a_wins, bot_b_wins, draws, games_played
+        nonlocal bot_a_violations, bot_b_violations, aborted_games
+        if exc: aborted_games += 1
+        else: game_lengths.append(mc)
+        if sw:
+            for d, c in da.items(): bot_b_depths[d] += c
+            for d, c in db.items(): bot_a_depths[d] += c
+            bot_b_violations += va; bot_a_violations += vb
+            bot_b_time[0] += ta[0]; bot_b_time[1] += ta[1]
+            bot_a_time[0] += tb[0]; bot_a_time[1] += tb[1]
+            if wv == 1: bot_b_wins += 1
+            elif wv == 2: bot_a_wins += 1
+            else: draws += 1
+        else:
+            for d, c in da.items(): bot_a_depths[d] += c
+            for d, c in db.items(): bot_b_depths[d] += c
+            bot_a_violations += va; bot_b_violations += vb
+            bot_a_time[0] += ta[0]; bot_a_time[1] += ta[1]
+            bot_b_time[0] += tb[0]; bot_b_time[1] += tb[1]
+            if wv == 1: bot_a_wins += 1
+            elif wv == 2: bot_b_wins += 1
+            else: draws += 1
+        games_played += 1
 
-            if swapped:
-                for d, c in d_a.items(): bot_b_depths[d] += c
-                for d, c in d_b.items(): bot_a_depths[d] += c
-                bot_b_violations += v_a
-                bot_a_violations += v_b
-                bot_b_time[0] += t_a[0]; bot_b_time[1] += t_a[1]
-                bot_a_time[0] += t_b[0]; bot_a_time[1] += t_b[1]
-                if winner == Player.A:     bot_b_wins += 1
-                elif winner == Player.B:   bot_a_wins += 1
-                else:                      draws += 1
-            else:
-                for d, c in d_a.items(): bot_a_depths[d] += c
-                for d, c in d_b.items(): bot_b_depths[d] += c
-                bot_a_violations += v_a
-                bot_b_violations += v_b
-                bot_a_time[0] += t_a[0]; bot_a_time[1] += t_a[1]
-                bot_b_time[0] += t_b[0]; bot_b_time[1] += t_b[1]
-                if winner == Player.A:     bot_a_wins += 1
-                elif winner == Player.B:   bot_b_wins += 1
-                else:                      draws += 1
-
-            games_played += 1
+    if mode in ("random", "self"):
+        workers = min(num_games, os.cpu_count() or 1)
+        args = [(time_limit, i, win_length, max_moves, mode, CURRENT_DIR)
+                for i in range(num_games)]
+        from multiprocessing import Pool
+        with Pool(workers) as pool:
+            it = pool.imap_unordered(_play_one_same, args)
             if use_tqdm:
-                results_iter.set_postfix(A=bot_a_wins, B=bot_b_wins, D=draws)
+                it = tqdm(it, total=num_games, desc="Games", unit="game")
+            for raw in it:
+                wv, sw, da, db, va, vb, exc, ta, tb, mc = raw
+                _accum(wv, sw, da, db, va, vb, exc, ta, tb, mc)
+                if use_tqdm:
+                    it.set_postfix(A=bot_a_wins, B=bot_b_wins, D=draws)
+    else:
+        # current vs best: subprocess per game
+        python_exe = sys.executable
+        workers = min(num_games, os.cpu_count() or 1)
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(_play_one_cross, ROOT, python_exe,
+                                       time_limit, i, win_length, max_moves)
+                       for i in range(num_games)]
+            it = as_completed(futures)
+            if use_tqdm:
+                it = tqdm(it, total=num_games, desc="Games", unit="game")
+            for future in it:
+                raw = future.result()
+                if raw is None:
+                    aborted_games += 1; games_played += 1; continue
+                _accum(raw["winner"], raw["swapped"],
+                       {int(k): v for k, v in raw["d_a"].items()},
+                       {int(k): v for k, v in raw["d_b"].items()},
+                       raw["v_a"], raw["v_b"], raw["exceeded"],
+                       (raw["t_a"][0], raw["t_a"][1]),
+                       (raw["t_b"][0], raw["t_b"][1]),
+                       raw["move_count"])
+                if use_tqdm:
+                    it.set_postfix(A=bot_a_wins, B=bot_b_wins, D=draws)
 
     elapsed = time.time() - t0
     total = max(games_played, 1)
@@ -302,45 +441,31 @@ def evaluate(num_games=20, win_length=6, time_limit=0.1, use_tqdm=True,
     print(f"  {name_b:>15s}: {bot_b_wins:3d} wins ({100*bot_b_wins/total:.0f}%)")
     print(f"  {'Draws':>15s}: {draws:3d}      ({100*draws/total:.0f}%)")
 
-    win_rate, ci_lo, ci_hi, p_value, elo_diff, elo_lo, elo_hi = _win_rate_stats(bot_a_wins, bot_b_wins, draws)
-    print(f"\n  {name_a} win rate: {100*win_rate:.1f}% "
-          f"(95% CI: {100*ci_lo:.1f}%\u2013{100*ci_hi:.1f}%)")
-    def _fmt_elo(e):
-        return ("+\u221e" if e > 0 else "-\u221e") if math.isinf(e) else f"{e:+.0f}"
-    print(f"  Elo difference: {_fmt_elo(elo_diff)} "
-          f"(95% CI: {_fmt_elo(elo_lo)} to {_fmt_elo(elo_hi)})")
-    if p_value < 0.001:
-        p_str = f"{p_value:.1e}"
-    else:
-        p_str = f"{p_value:.3f}"
-    sig = "*" if p_value < 0.05 else ""
-    print(f"  p-value (H\u2080: equal strength): {p_str} {sig}")
+    wr, ci_lo, ci_hi, pv, elo, elo_lo, elo_hi = _win_rate_stats(bot_a_wins, bot_b_wins, draws)
+    print(f"\n  {name_a} win rate: {100*wr:.1f}% (95% CI: {100*ci_lo:.1f}%\u2013{100*ci_hi:.1f}%)")
+    fe = lambda e: ("+\u221e" if e > 0 else "-\u221e") if math.isinf(e) else f"{e:+.0f}"
+    print(f"  Elo difference: {fe(elo)} (95% CI: {fe(elo_lo)} to {fe(elo_hi)})")
+    ps = f"{pv:.1e}" if pv < 0.001 else f"{pv:.3f}"
+    print(f"  p-value (H\u2080: equal strength): {ps} {'*' if pv < 0.05 else ''}")
     print()
 
     for name, depths in [(name_a, bot_a_depths), (name_b, bot_b_depths)]:
-        if not depths:
-            continue
-        total_moves = sum(depths.values())
-        avg = sum(d * c for d, c in depths.items()) / total_moves
-        lo, hi = min(depths), max(depths)
-        print(f"  {name} search depth: avg {avg:.1f}, range [{lo}-{hi}]")
-        buckets = sorted(depths.items())
-        dist = "  ".join(f"d{d}:{c}" for d, c in buckets)
-        print(f"    {dist}")
+        if not depths: continue
+        tm = sum(depths.values())
+        avg = sum(d * c for d, c in depths.items()) / tm
+        print(f"  {name} search depth: avg {avg:.1f}, range [{min(depths)}-{max(depths)}]")
+        print(f"    {'  '.join(f'd{d}:{c}' for d, c in sorted(depths.items()))}")
 
     for name, bt in [(name_a, bot_a_time), (name_b, bot_b_time)]:
         if bt[1] > 0:
-            avg_ms = 1000 * bt[0] / bt[1]
-            print(f"  {name} avg move time: {avg_ms:.0f}ms ({bt[1]} moves)")
+            print(f"  {name} avg move time: {1000*bt[0]/bt[1]:.0f}ms ({bt[1]} moves)")
 
     if game_lengths:
-        avg_len = sum(game_lengths) / len(game_lengths)
-        lo_len, hi_len = min(game_lengths), max(game_lengths)
-        print(f"\n  Game length: avg {avg_len:.1f} moves, range [{lo_len}-{hi_len}]")
+        print(f"\n  Game length: avg {sum(game_lengths)/len(game_lengths):.1f} moves, "
+              f"range [{min(game_lengths)}-{max(game_lengths)}]")
 
     if bot_a_violations or bot_b_violations or aborted_games:
-        print()
-        print(f"  TIME VIOLATIONS: {name_a}={bot_a_violations}, {name_b}={bot_b_violations}"
+        print(f"\n  TIME VIOLATIONS: {name_a}={bot_a_violations}, {name_b}={bot_b_violations}"
               f"  ({aborted_games} games forfeited)")
 
     print(f"{'='*50}")
@@ -348,16 +473,30 @@ def evaluate(num_games=20, win_length=6, time_limit=0.1, use_tqdm=True,
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Evaluate SealBot.")
+    parser = argparse.ArgumentParser(description="Evaluate SealBot: current vs best.")
     parser.add_argument("-n", "--num-games", type=int, default=20,
                         help="Number of games (default: 20)")
     parser.add_argument("-t", "--time-limit", type=float, default=0.1,
                         help="Time limit per move in seconds (default: 0.1)")
+    parser.add_argument("--random", action="store_true",
+                        help="Play current against built-in random bot")
     parser.add_argument("--self-play", action="store_true",
-                        help="SealBot vs SealBot instead of vs random")
+                        help="current vs itself")
     parser.add_argument("--no-tqdm", action="store_true",
                         help="Disable progress bar")
     parsed = parser.parse_args()
 
+    if parsed.random:
+        mode = "random"
+    elif parsed.self_play:
+        mode = "self"
+    else:
+        mode = "best"
+        for d, label in [(CURRENT_DIR, "current"), (BEST_DIR, "best")]:
+            if _find_so(d) is None:
+                print(f"Error: no minimax_cpp .so in {d}/")
+                print(f"  Run: make build")
+                sys.exit(1)
+
     evaluate(num_games=parsed.num_games, time_limit=parsed.time_limit,
-             use_tqdm=not parsed.no_tqdm, self_play=parsed.self_play)
+             use_tqdm=not parsed.no_tqdm, mode=mode)

@@ -17,6 +17,9 @@ import sys
 import math
 import time
 import pygame
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "current"))
 from game import HexGame, Player
 from minimax_cpp import MinimaxBot
 
