@@ -238,93 +238,49 @@ def _play_one_same(args):
             exceeded, t_a, t_b, t_a[1] + t_b[1])
 
 
-# ── Subprocess worker for current vs best ──
-# (Two different C extensions with same PyInit_ name can't coexist in one process)
+# ── Bot server subprocess for current vs best ──
+# Each bot runs in its own subprocess to avoid CPython's C extension cache
+# returning the same module for both (del sys.modules doesn't work for C exts).
 
-_WORKER_SCRIPT = r'''
+_BOT_SERVER_SCRIPT = r'''
 import sys, json, os, time
-from collections import defaultdict
 
-root_dir, time_limit, game_idx, win_length, max_moves = (
-    sys.argv[1], float(sys.argv[2]),
-    int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5]))
+bot_dir, root_dir = sys.argv[1], sys.argv[2]
+time_limit = float(sys.argv[3])
 
-best_dir = os.path.join(root_dir, "best")
-current_dir = os.path.join(root_dir, "current")
+sys.path.insert(0, bot_dir)
+from minimax_cpp import MinimaxBot
 
-# Load best first, stash it, then load current
-sys.path.insert(0, best_dir)
-import minimax_cpp as _best_mod
-BestBot = _best_mod.MinimaxBot
-del sys.modules["minimax_cpp"]
-sys.path.pop(0)
-
-sys.path.insert(0, current_dir)
-import minimax_cpp
-CurrentBot = minimax_cpp.MinimaxBot
-
-# game.py is in root_dir
 sys.path.insert(0, root_dir)
-import game as game_mod
+from game import HexGame, Player
 
-swapped = game_idx % 2 == 1
+bot = MinimaxBot(time_limit)
 
-class Bot:
-    def __init__(self, name, engine, tl):
-        self.name = name
-        self._e = engine
-        self.time_limit = tl
-    @property
-    def last_depth(self):
-        return getattr(self._e, "last_depth", 0)
-    def get_move(self, g):
-        self._e.time_limit = self.time_limit
-        return self._e.get_move(g)
+for line in sys.stdin:
+    line = line.strip()
+    if not line or line == "quit":
+        break
+    req = json.loads(line)
 
-cur = Bot("current", CurrentBot(time_limit), time_limit)
-bst = Bot("best", BestBot(time_limit), time_limit)
+    bot.time_limit = req.get("time_limit", time_limit)
 
-if swapped:
-    seat_a, seat_b = bst, cur
-else:
-    seat_a, seat_b = cur, bst
+    g = HexGame(win_length=req["win_length"])
+    for pos, v in req["board"]:
+        g.board[(pos[0], pos[1])] = Player(v)
+    g.current_player = Player(req["current_player"])
+    g.moves_left_in_turn = req["moves_left"]
+    g.move_count = req["move_count"]
 
-g = game_mod.HexGame(win_length=win_length)
-bots = {game_mod.Player.A: seat_a, game_mod.Player.B: seat_b}
-da, db = defaultdict(int), defaultdict(int)
-ta, tb = [0.0, 0], [0.0, 0]
-total = 0; violations = {}; exceeded = False; winner_val = 0
-
-while not g.game_over:
-    p = g.current_player
-    b = bots[p]
     t0 = time.time()
-    moves = b.get_move(g)
-    el = time.time() - t0
-    if not moves:
-        winner_val = 2 if p == game_mod.Player.A else 1; break
-    nm = len(moves)
-    (ta if p == game_mod.Player.A else tb)[0] += el
-    (ta if p == game_mod.Player.A else tb)[1] += nm
-    (da if p == game_mod.Player.A else db)[b.last_depth] += nm
-    if el > b.time_limit * nm * 3.0:
-        violations[b.name] = violations.get(b.name, 0) + 1
-        if violations[b.name] >= 10: exceeded = True; break
-    total += nm
-    if total >= max_moves: break
-    bad = False
-    for q, r in moves:
-        if g.game_over or not g.make_move(q, r): bad = True; break
-    if bad:
-        winner_val = 2 if p == game_mod.Player.A else 1; break
+    moves = bot.get_move(g)
+    elapsed = time.time() - t0
 
-if not exceeded and g.game_over:
-    winner_val = g.winner.value
-
-print(json.dumps({"winner": winner_val, "swapped": swapped,
-    "d_a": dict(da), "d_b": dict(db),
-    "v_a": violations.get(seat_a.name, 0), "v_b": violations.get(seat_b.name, 0),
-    "exceeded": exceeded, "t_a": ta, "t_b": tb, "move_count": total}))
+    sys.stdout.write(json.dumps({
+        "moves": [list(m) for m in moves] if moves else [],
+        "elapsed": elapsed,
+        "depth": getattr(bot, "last_depth", 0),
+    }) + "\n")
+    sys.stdout.flush()
 '''
 
 
@@ -335,17 +291,124 @@ def _find_so(directory):
     return None
 
 
+def _start_bot_server(python_exe, bot_dir, root_dir, time_limit):
+    return subprocess.Popen(
+        [python_exe, "-c", _BOT_SERVER_SCRIPT, bot_dir, root_dir, str(time_limit)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True)
+
+
+def _request_move(proc, game, time_limit):
+    """Send game state to a bot server, return (moves, elapsed, depth) or None."""
+    board = [[[q, r], v.value] for (q, r), v in game.board.items()]
+    req = json.dumps({
+        "win_length": game.win_length,
+        "board": board,
+        "current_player": game.current_player.value,
+        "moves_left": game.moves_left_in_turn,
+        "move_count": game.move_count,
+        "time_limit": time_limit,
+    }) + "\n"
+    try:
+        proc.stdin.write(req)
+        proc.stdin.flush()
+        resp_line = proc.stdout.readline()
+        if not resp_line:
+            return None
+        resp = json.loads(resp_line)
+        return [tuple(m) for m in resp["moves"]], resp["elapsed"], resp["depth"]
+    except (BrokenPipeError, json.JSONDecodeError, OSError):
+        return None
+
+
 def _play_one_cross(root_dir, python_exe, time_limit, game_idx,
                     win_length, max_moves):
-    result = subprocess.run(
-        [python_exe, "-c", _WORKER_SCRIPT,
-         root_dir, str(time_limit), str(game_idx),
-         str(win_length), str(max_moves)],
-        capture_output=True, text=True, timeout=max_moves * time_limit * 4 + 30)
-    if result.returncode != 0:
-        sys.stderr.write(result.stderr)
+    swapped = game_idx % 2 == 1
+    current_dir = os.path.join(root_dir, "current")
+    best_dir = os.path.join(root_dir, "best")
+
+    proc_cur = _start_bot_server(python_exe, current_dir, root_dir, time_limit)
+    proc_best = _start_bot_server(python_exe, best_dir, root_dir, time_limit)
+
+    try:
+        game = HexGame(win_length=win_length)
+
+        if swapped:
+            procs = {Player.A: proc_best, Player.B: proc_cur}
+        else:
+            procs = {Player.A: proc_cur, Player.B: proc_best}
+
+        da, db = defaultdict(int), defaultdict(int)
+        ta, tb = [0.0, 0], [0.0, 0]
+        total = 0
+        violations = {}
+        exceeded = False
+        winner_val = 0
+        game_deadline = time.time() + max_moves * time_limit * 4 + 30
+
+        while not game.game_over:
+            if time.time() > game_deadline:
+                break
+
+            p = game.current_player
+            result = _request_move(procs[p], game, time_limit)
+            if result is None:
+                winner_val = 2 if p == Player.A else 1
+                break
+
+            moves, elapsed, depth = result
+
+            if not moves:
+                winner_val = 2 if p == Player.A else 1
+                break
+
+            nm = len(moves)
+            t_arr = ta if p == Player.A else tb
+            t_arr[0] += elapsed
+            t_arr[1] += nm
+            (da if p == Player.A else db)[depth] += nm
+
+            if elapsed > time_limit * nm * GRACE_FACTOR:
+                seat = "a" if p == Player.A else "b"
+                violations[seat] = violations.get(seat, 0) + 1
+                if violations[seat] >= MAX_VIOLATIONS_PER_GAME:
+                    exceeded = True
+                    break
+
+            total += nm
+            if total >= max_moves:
+                break
+
+            bad = False
+            for q, r in moves:
+                if game.game_over or not game.make_move(q, r):
+                    bad = True
+                    break
+            if bad:
+                winner_val = 2 if p == Player.A else 1
+                break
+
+        if not exceeded and game.game_over:
+            winner_val = game.winner.value
+
+        return {
+            "winner": winner_val, "swapped": swapped,
+            "d_a": dict(da), "d_b": dict(db),
+            "v_a": violations.get("a", 0), "v_b": violations.get("b", 0),
+            "exceeded": exceeded, "t_a": list(ta), "t_b": list(tb),
+            "move_count": total,
+        }
+    except Exception as e:
+        sys.stderr.write(f"Game {game_idx} error: {e}\n")
         return None
-    return json.loads(result.stdout.strip())
+    finally:
+        for proc in [proc_cur, proc_best]:
+            try:
+                proc.stdin.close()
+                proc.wait(timeout=5)
+            except Exception:
+                proc.kill()
+                proc.wait()
 
 
 # ── Main evaluate ──

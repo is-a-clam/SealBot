@@ -16,7 +16,7 @@ SealBot uses **iterative deepening alpha-beta minimax** with a pattern-based eva
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-make build
+./build.sh
 ```
 
 ## Project Structure
@@ -28,6 +28,7 @@ SealBot/
 ├── game.py        # Game rules (don't modify)
 ├── evaluate.py    # Run current vs best
 ├── play.py        # Play against the bot interactively
+├── build.sh       # Clean + rebuild both bots
 └── Makefile
 ```
 
